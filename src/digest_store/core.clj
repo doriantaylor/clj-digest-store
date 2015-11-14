@@ -1,4 +1,4 @@
-(ns store-digest.core
+(ns digest-store.core
   (:use [digest]
         [cupboard.bdb.je]
         [clojure.java.io])

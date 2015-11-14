@@ -1,8 +1,8 @@
-(ns store-digest.fs-bdb
+(ns digest-store.fs-bdb
   "Filesystem/Berkeley DB-based driver for digest store"
   (:use cupboard.bdb.je 
         [clojure.string :only [split]]
-        [store-digest.core :only [DigestStore digest-store]])
+        [digest-store.core :only [DigestStore digest-store]])
   (:require [clojure.java.io :as io])
   (:import [org.apache.commons.codec.binary Base32 Base64 Hex]
            [java.net URI URL]
@@ -24,7 +24,7 @@
 
 (defmethod digest-store :fs-bdb [& conf-args]
   "Create and open a filesystem/Berkeley DB-based digest store."
-  (let [defaults {:dir "/tmp/store-digest"
+  (let [defaults {:dir "/tmp/digest-store"
                   :algorithms #{:md5 :sha-1 :sha-256 :sha-384 :sha-512}
                   :primary :sha-256 }
         conf (let [c (if (nil? conf-args) defaults (merge defaults conf-args))
