@@ -1,6 +1,6 @@
 (defproject digest-store "0.1.0-SNAPSHOT"
-  :description "FIXME: write description"
-  :url "http://example.com/FIXME"
+  :description " Unified front end for content-addressable storage using multiple hash algorithms and RFC 6920 URIs"
+  :url "https://github.com/doriantaylor/clj-digest-store"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :dependencies [
