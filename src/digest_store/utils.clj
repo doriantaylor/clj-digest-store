@@ -7,30 +7,11 @@
            [java.security MessageDigest])
 )
 
-(defmulti base32-encode
-  (fn [x] (class x)))
+;; base64 stuff
 
-(defmethod base32-encode (Class/forName "[B") [b]
-  (first (split (.toLowerCase (String. (.encode (Base32. 0) b))) #"=")))
-
-(defmethod base32-encode String [s]
-  (base32-encode (.getBytes s)))
-
-;; (defn base32-encode
-;;   "Encode a base32 string"
-;;   ;; Base32 constructor with an argument of 0 means no line separator
-;;   ([^String s]
-;;    (base32-encode (.getBytes s)))
-;;   ([^bytes b] 
-
-(defn base32-decode [str]
-  "Decode a base32 string into uh, something?"
-  (.decode (Base32.) (.toUpperCase str)))
-
-(defn base32-to-hex-string [str]
-  (String. (.encode (Hex.) (base32-decode str))))
-
-(defmulti base64-encode (fn [s & urlsafe] (type s)))
+(defmulti base64-encode
+  "Turn a string or byte array into a Base64 string."
+  (fn [s & urlsafe] (type s)))
 
 (defmethod base64-encode (Class/forName "[B") [b & urlsafe]
   (first (split (String. (.encode
@@ -40,8 +21,46 @@
 (defmethod base64-encode String [s & urlsafe]
   (base64-encode (.getBytes s) urlsafe))
 
-(defn base64-decode [str] (.decode (Base64.) str))
-  
+(defn base64-decode
+  "Turn a Base64 string or byte array into a decoded byte array."
+  [str] (.decode (Base64.) str))
+
+;; base32 stuff
+
+(defmulti base32-encode
+  "Turn a string or byte array into a Base32 string."
+  (fn [x] (type x)))
+
+;; for the record i don't know how else to say byte array
+(defmethod base32-encode (Class/forName "[B") [b]
+  (first (split (.toLowerCase (String. (.encode (Base32. 0) b))) #"=")))
+
+(defmethod base32-encode String [s]
+  (base32-encode (.getBytes s)))
+
+(defn base32-decode [str]
+  "Turn a Base32 string or byte array into a decoded byte array."
+  (.decode (Base32.) (.toUpperCase str)))
+
+;; hexadecimal stuff
+
+(defmulti hex-encode
+  "Turn a string or byte array into a hexadecimal string."
+  (fn [str & upper-case] (type str)))
+
+(defmethod hex-encode (Class/forName "[B") [b & upper-case]
+  (let [s (String. (.encode (Hex.) b))]
+    (if upper-case (.toUpperCase s) (.toLowerCase s))))
+
+(defmethod hex-encode String [s & upper-case]
+  (hex-encode (.getBytes s)))
+
+;; this little guy can probably get nuked
+
+(defn base32-to-hex-string [str]
+  (String. (.encode (Hex.) (base32-decode str))))
+
+;; uri stuff
 
 (defprotocol URICoercions
   (as-uri [x] "Coerce the thing to a java.net.URI"))
@@ -64,10 +83,6 @@
                            (Base64. 0 (byte-array 0) true) (.digest m))))))
   )
 
-(defn uuid-urn []
-  "Make a random (V4) urn:uuid:..."
-  (as-uri (. UUID randomUUID)))
-
 (defn- ni-uri-split [uri]
   (vec (rest (re-find #"^/*([^;]+);+(.*?)$" (.getPath (as-uri uri))))))
 
@@ -81,6 +96,38 @@
         ;; base64 constructor is url safe
         digest (.decode (Base64. true) b64digest)]
     (String. (.encode (Hex.) digest))))
+
+;; uuid stuff
+
+(defmulti uuid
+  "Create a UUID object from a string or URI, or generate a random one."
+  (fn
+    ([x] (type x))
+    ([] :default)))
+
+(defmethod uuid
+;;  "Make a UUID from a string."
+  String [s] (UUID/fromString s))
+
+(defmethod uuid
+;;  "Make a UUID from a urn:uuid URI object."
+  URI [u] (let [[_ s] (re-find #"^(?i:urn:uuid:)([0-9A-Fa-f-]+)$"
+                               (.toString u))]
+            (if (nil? s) (throw (IllegalArgumentException.
+                                 (str u " not a urn:uuid")))
+                (uuid s))))
+
+(defmethod uuid
+  :default [] (. UUID randomUUID))
+
+(defmethod uuid
+  nil [_] (uuid))
+
+(defn uuid-urn
+  "Make a urn:uuid:..."
+  [& u]
+  (println u)
+  (as-uri (uuid (first u))))
 
 (defn uuid-to-ncname
   "Turn a UUID into a NCName."
@@ -126,17 +173,20 @@
         ;; here's the byte buffer again
         bb (doto
                (. ByteBuffer allocate (* (/ (. Long SIZE) (. Byte SIZE)) 2))
-             (.put (decoder content))
-             (.rewind))
+             (.put (decoder content)) (.rewind))
         hi (.getLong bb)
         lo (.getLong bb)
+        ;; put the uuid version back in the high number and clip off
+        ;; the last sixteen bits down four.
         hi-mod (bit-or (bit-and hi (bit-not 16rffff))
                        (bit-shift-left version 12)
                        (bit-shift-right (bit-and hi 16rffff) 4))
-        ;; fix the last byte because this shit is confusing
+        ;; fix the last byte because this shit is confusing.
         lo-tmp (bit-or (bit-and lo (bit-not 16rff))
                        (bit-shift-left (bit-and lo 16rff)
                                        (if no-case 1 2)))
+        ;; put the lowest four bits from hi at the top, then lo-tmp
+        ;; shifted right (and clip off the damn high bits).
         lo-mod (bit-or
                 (bit-shift-left hi 60)
                 (bit-and (bit-shift-right lo-tmp 4)
@@ -145,4 +195,3 @@
     ;;(println (format "%x %x %x" hi-mod lo-tmp lo-mod))
     ;; and that's that
     (UUID. hi-mod lo-mod)))
-
