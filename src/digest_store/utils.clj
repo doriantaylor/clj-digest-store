@@ -11,15 +11,15 @@
 
 (defmulti base64-encode
   "Turn a string or byte array into a Base64 string."
-  (fn [s & urlsafe] (type s)))
+  (fn [s & url-safe] (type s)))
 
-(defmethod base64-encode (Class/forName "[B") [b & urlsafe]
+(defmethod base64-encode (Class/forName "[B") [b & url-safe]
   (first (split (String. (.encode
                           (Base64. 0 (byte-array 0) 
-                                   (boolean urlsafe)) b)) #"=")))
+                                   (boolean (first url-safe))) b)) #"=")))
 
-(defmethod base64-encode String [s & urlsafe]
-  (base64-encode (.getBytes s) urlsafe))
+(defmethod base64-encode String [s & url-safe]
+  (base64-encode (.getBytes s) (first url-safe)))
 
 (defn base64-decode
   "Turn a Base64 string or byte array into a decoded byte array."
@@ -50,10 +50,14 @@
 
 (defmethod hex-encode (Class/forName "[B") [b & upper-case]
   (let [s (String. (.encode (Hex.) b))]
-    (if upper-case (.toUpperCase s) (.toLowerCase s))))
+    (if (first upper-case) (.toUpperCase s) (.toLowerCase s))))
 
 (defmethod hex-encode String [s & upper-case]
-  (hex-encode (.getBytes s)))
+  (hex-encode (.getBytes s) (first upper-case)))
+
+(defn hex-decode
+  "Turn a hexadecimal string into a decoded byte array."
+  [s] (.decode (Hex.) s))
 
 ;; this little guy can probably get nuked
 
@@ -78,9 +82,8 @@
   (as-uri [u] (as-uri (str "urn:uuid:" u)))
   MessageDigest
   (as-uri [m]
-    (as-uri (str "ni:///" (.getAlgorithm m) ";"
-                 (String. (.encode
-                           (Base64. 0 (byte-array 0) true) (.digest m))))))
+    (as-uri
+     (str "ni:///" (.getAlgorithm m) ";" (base64-encode (.digest m) true))))
   )
 
 (defn- ni-uri-split [uri]
@@ -92,10 +95,7 @@
 
 (defn ni-uri-digest [uri]
   "Retrieve the (hexadecimal) digest from an ni: URI"
-  (let [[algo b64digest] (ni-uri-split uri)
-        ;; base64 constructor is url safe
-        digest (.decode (Base64. true) b64digest)]
-    (String. (.encode (Hex.) digest))))
+  (let [[_ digest] (ni-uri-split uri)] (hex-encode (base64-decode digest))))
 
 ;; uuid stuff
 
@@ -105,21 +105,26 @@
     ([x] (type x))
     ([] :default)))
 
-(defmethod uuid
 ;;  "Make a UUID from a string."
+(defmethod uuid
   String [s] (UUID/fromString s))
 
-(defmethod uuid
 ;;  "Make a UUID from a urn:uuid URI object."
+(defmethod uuid
   URI [u] (let [[_ s] (re-find #"^(?i:urn:uuid:)([0-9A-Fa-f-]+)$"
                                (.toString u))]
             (if (nil? s) (throw (IllegalArgumentException.
                                  (str u " not a urn:uuid")))
                 (uuid s))))
 
+;; noop method
+(defmethod uuid UUID [u] u)
+
+;; empty 
 (defmethod uuid
   :default [] (. UUID randomUUID))
 
+;; blank
 (defmethod uuid
   nil [_] (uuid))
 
@@ -128,6 +133,48 @@
   [& u]
   (println u)
   (as-uri (uuid (first u))))
+
+;;;; UUID-NCName conversion algorithm:
+
+;;;; 1) Get a binary representation of the UUID.
+;;;; 2) Pull out the version nybble (4 bits at bit 48)
+;;;; 3) Shift all subsequent bits 4 to the left.
+;;;; 4) Shift the last byte right, 1 bit for Base32, 2 for Base64.
+;;;; 5) Encode in either Base32 (case-insensitive) or Base64.
+;;;; 6) Truncate the last character (always 0) and remove "=" padding.
+;;;; 7) Encode the version nybble as a letter (A-P) and put it in front.
+
+;;;; Do this in reverse to decode the UUID.
+
+;;;; The purpose of putting the version nybble at the front is to
+;;;; guarantee that the resulting string is a valid NCName. This value
+;;;; is always case-insensitive (at least insofar as decoding is
+;;;; concerned), as it maps 4 bits to the first 16 letters of the
+;;;; alphabet. URL-safe Base64 encoding is suitable for XML IDs and
+;;;; RDF blank nodes, as well as Clojure symbols and keywords. Base32,
+;;;; being naturally case-insensitive and containing only alphanumeric
+;;;; characters, is suitable for generated identifiers in languages
+;;;; that do not permit (e.g.) hyphens, though its representation will
+;;;; be slightly longer.
+
+;;;; The purpose of shifting the last byte is to ensure that it fits
+;;;; into the encoding alphabet. After the version nybble is removed,
+;;;; there are 124 bits of information in the UUID (well, 122, but
+;;;; let's not split hairs). However, the first 15 bytes (120 bits)
+;;;; are encoded cleanly by both schemes, as 15*8 = 20*6 = 24*5 =
+;;;; 120. This leaves us with the last 5 or 6 bits to deal with. The
+;;;; encoding schemes take the high bits first, so by moving the
+;;;; remaining four bits down one for Base32 and two for Base64 will
+;;;; guarantee that the remaining bits occupy the lowest values in
+;;;; their respective encoding alphabets.
+
+;;;; The implementation in org.apache.commons.codec.binary appears
+;;;; to pad incomplete bytes when encoding, and truncate them
+;;;; when decoding. This will put an "A" (ordinal 0) at the end of the
+;;;; encoded sequence, and if that terminating "A" is missing when
+;;;; decoding, it will discard the last symbol. So we take it off when
+;;;; encoding, because it contains no information, but we have to put
+;;;; it back on when we decode the string.
 
 (defn uuid-to-ncname
   "Turn a UUID into a NCName."
@@ -181,7 +228,7 @@
         hi-mod (bit-or (bit-and hi (bit-not 16rffff))
                        (bit-shift-left version 12)
                        (bit-shift-right (bit-and hi 16rffff) 4))
-        ;; fix the last byte because this shit is confusing.
+        ;; fix the last byte first because this shit is confusing.
         lo-tmp (bit-or (bit-and lo (bit-not 16rff))
                        (bit-shift-left (bit-and lo 16rff)
                                        (if no-case 1 2)))
