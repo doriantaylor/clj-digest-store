@@ -1,11 +1,35 @@
 (ns digest-store.core
   (:use [digest :only [Digestible]]
+        [clojure.set :only [intersection]]
         [digest-store.utils]
         [clojure.java.io])
   (:require [pantomime.mime :as pm])
-  (:import [java.security MessageDigest] [java.util Arrays]
-           [java.io InputStream])
+  (:import [java.security MessageDigest]
+           [java.util Arrays Date] [java.io InputStream])
 )
+
+(def ^:const valid-digests
+  "A set of supported digest algorithms, normalized to keywords."
+  (let [x (intersection
+           ;; currently there are a bunch of synonyms as strings
+           (set (map #(keyword (.toLowerCase %)) (digest/algorithms)))
+           ;; here are our normalized algorithm names
+           #{:md5 :sha-1 :sha-256 :sha-384 :sha-512})]
+        x))
+
+(defn- sort-digest-size-then-lexical
+  "Does what it says on the tin."
+  [a b]
+  (let [f1 (first a) f2 (first b) s1 (second a) s2 (second b)]
+    (or (< s1 s2) (and (= s1 s2) (< (compare f1 f2) 0)))))
+
+(def ^:const digest-sequence
+  "A sorted map of digest algorithms and their byte lengths."
+  (into (array-map)
+        (sort sort-digest-size-then-lexical
+              (map #(vec [% (.getDigestLength
+                             (MessageDigest/getInstance (name %)))])
+                   valid-digests))))
 
 (defprotocol DigestStore
   (store-add    [store item] "Add an item to the digest store.")
@@ -31,7 +55,9 @@
         sig (.toString (BigInteger. 1 (.digest algorithm)) 16)
         padding (apply str (repeat (- size (count sig)) "0"))]
     (str padding sig)))
+;; XXX on second thought we don't use this anymore so can probably nuke it.
 
+;; this little puppy generates all the digests at once and puts them in a map.
 (extend-protocol Digestible
   java.util.Collection
   (-digest [message algorithm]
@@ -67,7 +93,8 @@
   (last-inserted    [obj] "Get the last-inserted time for the store object.")
   (props-modified   [obj]
     "Get the property modification time for the store object.")
-  (deleted          [obj] "Get the deletion time for the store object.")
+  (removed          [obj]
+    "Get the time the object was removed from the store (if applicable).")
   (type-checked     [obj] "Get the type-checked flag from the store object.")
   (type-valid       [obj] "Get the type-valid flag from the store object.")
   (charset-checked  [obj] "Get the charset-checked flag from the store object.")
@@ -84,7 +111,10 @@
     [stream digests attrs times flags]
   StoreObjectProtocol
   ;; the thing
-  (stream           [obj] (:stream obj))
+  (stream           [obj]
+    (let [f (:stream obj)
+          s (if (fn? f) (f) f)]
+      (assert (instance? InputStream s) "Stream member not an InputStream") s))
   ;; cryptographic digests of the thing
   (digests          [obj] digests)
   (digest           [obj algorithm] (get digests algorithm))
@@ -97,7 +127,7 @@
   (first-seen       [obj] (:ctime times))
   (last-inserted    [obj] (:mtime times))
   (props-modified   [obj] (:ptime times))
-  (deleted          [obj] (:dtime times))
+  (removed          [obj] (:dtime times))
   ;; metadata pertaining to the heretofore-nonexistent checker process
   (type-checked     [obj] (:type-checked     flags))
   (type-valid       [obj] (:type-valid       flags))
@@ -110,7 +140,7 @@
 )
 
 (defn store-object [stream digests times flags]
-  ;; check that the stream is an InputStream or nil
+  ;; check that the stream is an fn, InputStream or nil
   ;; check that the digests contain the right key-value pairs
   ;; check that the times are java.util.Date
   ;; check that the flags are all there or supplant with defaults
