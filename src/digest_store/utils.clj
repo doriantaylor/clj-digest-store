@@ -86,12 +86,15 @@
      (str "ni:///" (.getAlgorithm m) ";" (base64-encode (.digest m) true))))
   )
 
+(defn ni-uri? [^URI uri]
+  (= (.toLowerCase (.getScheme uri)) "ni"))
+
 (defn- ni-uri-split [uri]
   (vec (rest (re-find #"^/*([^;]+);+(.*?)$" (.getPath (as-uri uri))))))
 
 (defn ni-uri-algorithm [uri]
   "Retrieve the algorithm string in an ni: URI"
-  (first (ni-uri-split (as-uri uri))))
+  (.toLowerCase (first (ni-uri-split (as-uri uri)))))
 
 (defn ni-uri-digest [uri]
   "Retrieve the (hexadecimal) digest from an ni: URI"

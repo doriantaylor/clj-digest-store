@@ -11,4 +11,5 @@
                  [byte-streams "0.2.0"]
                  [gloss "0.2.5"] 
                  [commons-codec/commons-codec "1.10"]
+                 [me.raynes/fs "1.4.6"]
                  ])
