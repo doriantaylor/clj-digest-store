@@ -81,6 +81,7 @@
 (defprotocol StoreObjectProtocol
   (stream  [obj] "Retrieve the stream from the store object, if it exists.")
   (stream? [obj] "True if the store object contains a stream.")
+  (metadata         [obj] "Get the store object's metadata all in one lump.")
   (digests [obj] "Retrieve a map of the digests for the store object")
   (digest  [obj algorithm]
     "Get the digest URI for the store object given the algorithm.")
@@ -124,6 +125,8 @@
   (digests          [obj] digests)
   (digest           [obj algorithm] (get digests algorithm))
   ;; metadata about the thing
+  (metadata         [obj]
+    { :digests digests :attrs attrs :times times :flags flags })
   (byte-size        [obj] (:size      attrs))
   (mime-type        [obj] (:type      attrs))
   (charset          [obj] (:charset   attrs))
@@ -241,7 +244,7 @@
         f (merge (into {} (map #(vec [% false]) valid-flags)) flags)]
     (assert (not (and stream (:dtime t)))
             "Can't have both a stream and a deletion time.")
-    (StoreObject. s d a t f))))
+    (->StoreObject s d a t f))))
 
 (defprotocol StoreObjectCoercions
   (as-store-object [obj] "Turn a thing into a StoreObject"))
@@ -266,7 +269,7 @@
     (let [algorithm (keyword (ni-uri-algorithm uri))]
       (when (not (contains? valid-digests algorithm))
         (throw (IllegalArgumentException.
-                (str algorithm " in " uri " is not a valid algorithm"))))
+                (str algorithm " in " uri " is not a recognized algorithm"))))
       (store-object nil { algorithm uri })))
   java.util.Map
   (as-store-object [m]

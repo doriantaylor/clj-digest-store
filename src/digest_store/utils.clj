@@ -1,6 +1,8 @@
 (ns digest-store.utils
   (:use [clojure.string :only [split]])
+  (:require [pantomime.mime :as pm])
   (:import [org.apache.commons.codec.binary Base32 Base64 Hex]
+           [org.apache.tika.mime MimeType MediaType]
            [java.net URI URL]
            [java.util UUID]
            [java.nio ByteBuffer]
@@ -245,3 +247,32 @@
     ;;(println (format "%x %x %x" hi-mod lo-tmp lo-mod))
     ;; and that's that
     (UUID. hi-mod lo-mod)))
+
+;; XXX all of this should be in pantomime
+
+;; XXX PS why the ƒ are there two different, incompatible, non-related
+;; classes in Tika (MimeType/MediaType)?
+
+(def ^:private TYPE-REGISTRY (.getMediaTypeRegistry pm/registry))
+
+(defprotocol MimeTypeCoercions
+  (as-mime-type  [x] "Turn whatever into a MimeType")
+  (as-media-type [x] "Turn whatever into a MediaType")
+)
+
+(extend-protocol MimeTypeCoercions
+  String
+  (as-mime-type  [^String x] (try (pm/for-name x)))
+  (as-media-type [^String x] (try (.getType (as-mime-type x))))
+  MimeType
+  (as-mime-type  [^MimeType x] x)
+  (as-media-type [^MimeType x] (.getType x))
+  MediaType
+  (as-mime-type  [^MediaType x] (.toString (.getBaseType x)))
+  (as-media-type [^MediaType x] x)
+)
+
+(defn mime-type-isa [a b]
+  (let [^MediaType ta (as-media-type a)
+        ^MediaType tb (as-media-type b)]
+    (.isInstanceOf TYPE-REGISTRY ta tb)))
