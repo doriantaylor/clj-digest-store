@@ -91,16 +91,19 @@
 (defn ni-uri? [^URI uri]
   (= (.toLowerCase (.getScheme uri)) "ni"))
 
-(defn- ni-uri-split [uri]
-  (vec (rest (re-find #"^/*([^;]+);+(.*?)$" (.getPath (as-uri uri))))))
+(defn ni-uri-split [uri]
+  (let [[_ algo digest] (re-find #"^/*([^;]+);+(.*?)$" (.getPath (as-uri uri)))]
+    [(keyword (.toLowerCase algo)) (-> digest (base64-decode) (hex-encode))] ))
 
-(defn ni-uri-algorithm [uri]
+(defn ni-uri-algorithm
   "Retrieve the algorithm string in an ni: URI"
-  (.toLowerCase (first (ni-uri-split (as-uri uri)))))
+  [uri]
+  (first (ni-uri-split (as-uri uri))))
 
-(defn ni-uri-digest [uri]
+(defn ni-uri-digest
   "Retrieve the (hexadecimal) digest from an ni: URI"
-  (let [[_ digest] (ni-uri-split uri)] (hex-encode (base64-decode digest))))
+  [uri]
+  (second (ni-uri-split (as-uri uri))))
 
 ;; uuid stuff
 

@@ -174,7 +174,11 @@
   "Create a new digest store object."
   ([] (store-object nil nil nil nil nil))
   ([stream] (store-object stream nil nil nil nil))
-  ([stream digests] (store-object stream digests nil nil nil))
+  ([stream metadata]
+   (if (:digests metadata)
+     (apply store-object
+            (cons stream (map #(% metadata) [:digests :attrs :times :flags])))
+     (store-object stream metadata nil nil nil)))
   ([stream digests attrs] (store-object stream digests attrs nil nil))
   ([stream digests attrs times] (store-object stream digests attrs times nil))
   ([stream digests attrs times flags]
@@ -259,7 +263,10 @@
     (assert (.exists file) (str file " does not exist"))
     (assert (.canRead file) (str file " is not readable"))
     (let [size (.length file)
-          type (pm/mime-type-of file)
+          ntype (pm/mime-type-of (.getName file)) ; based on filename
+          ctype (pm/mime-type-of file) ; based on content
+          ;; do this if the type is more specific
+          type (if (mime-type-isa ntype ctype) ntype ctype)
           mtime (.lastModified file)]
     (store-object #(input-stream file) nil {:size size :type type} mtime)))
   URI

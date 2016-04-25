@@ -1,5 +1,16 @@
 (ns digest-store.fs-bdb
-  "Filesystem/Berkeley DB-based driver for digest store"
+  "Filesystem/Berkeley DB-based driver for digest store.
+
+  This driver uses hashed directories on the file system to store
+  data, and Berkeley DB to store metadata.
+
+  As such, you have to give it a location, like this:
+
+  > (digest-store :fs-bdb { :dir \"/path/to/digest-store\" })
+
+  Other parameters include the preferred primary digest algorithm :primary, 
+
+  "
   (:use cupboard.bdb.je digest-store.core digest-store.utils
         [clojure.string :only [split trim join]]
         [clojure.set :only [intersection subset?]]
@@ -19,6 +30,7 @@
 
 (def STORE_DIR "store")
 (def TEMP_DIR  "tmp")
+(def BYTE_ARRAY (class (byte-array 0)))
 
 ;; 
 
@@ -140,6 +152,7 @@
         ba (into { primary key }
                  (map #(vec [% (byte-array (get digest-sizes %))])
                       (rest algos)))
+        ;;derp (println data)
         ^ByteBuffer bb (bs/to-byte-buffer data)
         digests (do
                   ;; snarf up the data first
@@ -153,13 +166,14 @@
         ;; gloss resets the byte buffer so we need to chop it off
         ;; or who knows, maybe i did. anyway it's sketchy.
         ^ByteBuffer mdb (bs/to-byte-buffer (bs/to-byte-array bb))
+        ;;hurr (println digests)
         metadata (try
                    (gio/decode metadata-codec mdb)
                    (catch Exception e
                      (bs/print-bytes mdb)
                      (throw e)))
         ]
-    ;;(println digests)
+    ;(println digests)
     {:digests digests
      ;; get rid of the empty strings
      :attrs (into {} (filter #(not= "" (second %))
@@ -225,6 +239,54 @@
   )
 )
 
+(defn- store-get-metadata-single
+  "Obtain a single metadata entry from an already-converted key-value pair."
+  ([store algorithm key]
+   (with-db-txn [txn (:env store)]
+     (store-get-metadata-single store algorithm key txn)))
+  ([store algorithm key txn]
+   (assert (contains? (-> store :conf :algorithms) algorithm)
+           "Digest algorithm must be present in data store!")
+   (assert (instance? BYTE_ARRAY key) "Key must be binary!")
+   (let [primary (-> store :conf :primary)
+         ;; this is kind of lame
+         db-fn (if (= algorithm primary) db-get db-sec-get)
+         db (-> store :entries algorithm)
+         [pk val] (db-fn db key :txn txn)]
+     (when-not (nil? pk)
+       (decode-metadata pk val (-> store :conf :algorithms) primary))))
+)
+
+(defn- store-get-metadata-multi
+  "Obtain a sequence of metadata entries from an already-converted key
+  and (potentially partial) value pair."
+  ([store algorithm key]
+   (with-db-txn [txn (:env store)]
+     (store-get-metadata-multi store algorithm key txn)))
+  ([store algorithm key txn]
+   (let [primary (-> store :conf :primary)
+         algos (-> store :conf :algorithms)
+         db (-> store :entries algorithm)
+         gap (- (digest-sizes algorithm) (count key))
+         pad (bs/to-byte-array key (repeat gap 255))
+         ;; cmp-fn form is test-key supplied-key
+         cmp-fn #(= (bs/compare-bytes (Arrays/copyOf %1 (count %2)) %2) 0)
+         ;;cmp-fn #(> (bs/compare-bytes %1 %2) 0)
+         dec-fn (fn [[k v]] (decode-metadata k v algos primary))]
+     (assert (>= gap 0) "Supplied key must be no longer than algorithm length!")
+     (with-db-cursor [cur db :txn txn]
+       ;; XXX HEISENBUG: the cursor disappears if this happens in a
+       ;; lazy seq and you get a NullPointerException.
+       (doall
+        (map dec-fn (db-cursor-scan cur key :comparison-fn cmp-fn)))))))
+
+(defn- store-get-metadata
+  ([store arg]
+   (with-db-txn [txn (:env store)] (store-get-metadata store arg txn)))
+  ([store arg txn]
+   
+))
+
 (defn- store-get-metadata
   "Given the store, and one or more digest URIs, sets or maps thereof,
   or list/seq of those, return a list of"
@@ -264,11 +326,12 @@
      (db-put (-> store :entries primary) canon
              (encode-metadata metadata
                               (-> store :conf :algorithms) primary) :txn txn)
-     ;; now do the rest of them
-     (doseq [other (required-algos (:digests metadata) primary)]
-       (db-put (-> store :entries other)
-               (hex-decode (ni-uri-digest (-> metadata :digests other)))
-               canon :txn txn))
+     ;; ;; now do the rest of them
+     ;; (doseq [other (required-algos (:digests metadata) primary)]
+     ;;   (db-put (-> store :entries other)
+     ;;           (hex-decode (ni-uri-digest (-> metadata :digests other)))
+     ;;           canon :txn txn))
+
      ;; iunno, return something?
      true)))
 
@@ -285,13 +348,18 @@
         obj (as-store-object item)
         ^File temp (File/createTempFile
                     "blob" "" (io/file (:dir conf) TEMP_DIR))]
+    ;; NOTE: we do not trust any assertions made in the input aside
+    ;; from things we can't directly scan for, like creation/
+    ;; modification date or MIME type specificity.
     (try
       (assert (stream? obj) "Can't add an object with no stream!")
+      ;; XXX do all of this concurrently?
       (let [digests (with-open [in (stream obj) out (io/output-stream temp)]
                       (digest/digest (:algorithms conf)
                                      (tee-seq in out 16r10000)))
             size (.length temp)
-            mime-type (pm/mime-type-of temp)
+            mime-type (let [t (mime-type obj) ct (pm/mime-type-of temp)]
+                        (if (mime-type-isa t ct) t ct))
             target-slug (-> (get digests (:primary conf))
                             (ni-uri-digest) (hex-decode) (base32-encode))
             ^File target-file (io/file (:dir conf) STORE_DIR
@@ -337,24 +405,61 @@
         ;; now deal with the metadata
         (let [m-in (metadata obj)
               m-out (merge m-in
-                           { :digests digests
-                            :attrs (merge
-                                    (:attrs m-in)
-                                    { :size size :type mime-type }) }) ]
-          (store-put-metadata store m-out))
-         
-        ;; return a 'new' store object
-        (store-object #(io/input-stream target-file)
-                      digests { :size size :type mime-type }))
+                           {;; digests have been scanned
+                            :digests digests
+                            ;; byte size and mime type have been scanned
+                            :attrs (merge (:attrs m-in)
+                                          { :size size :type mime-type })
+                            ;; remove dtime and set ptime to now
+                            :times (dissoc
+                                    (assoc (:times m-in) :ptime (Date.))
+                                    :dtime)
+                            ;; the mime type has now been checked
+                            :flags (assoc (:flags m-in) :type-checked true)
+                            }) ]
+          (with-db-txn [txn (:env store)]
+            (store-put-metadata store m-out txn)
+            ;; XXX we need to update stats/counts/whatever
+            )
+
+          ;; return a 'new' store object
+          (store-object #(io/input-stream target-file) m-out)))
+
 
         ;; XXX do something more sophisticated with the error here
         (catch Exception e (throw e))
-        (finally
-          (.delete temp)))))
+        ;; don't forget to nuke the temp file
+        (finally (.delete temp)))))
 
 (defn- fs-bdb-store-remove
-  ([store obj] (fs-bdb-store-remove store obj false))
-  ([store obj forget]
+  ([store arg] (fs-bdb-store-remove store arg false))
+  ([store arg forget]
+   ;; assert that the digest key is complete, i.e., not partial
+
+   ;; attempt to get the entry
+
+   ;; noop (return nil) if the entry is not present at all
+
+   ;; otherwise:
+
+   ;; entry ops:
+   ;; * noop if forget is false and dtime is true
+   ;; * if forget is false and dtime is false, set dtime to now and
+   ;;   update the entry
+   ;; * if forget is true, delete the entry altogether
+
+   ;; control ops:
+   ;; * decrement byte count (always)
+   ;; * decrement object count (always)
+   ;; * increment deleted count
+   ;;   * by 1 if entry exists and has no dtime
+   ;;   * by 0 if forget is false, 
+   ;; 
+   ;;     unless forgotten object was already deleted)
+   ;; * update store mtime
+
+   ;; filesystem ops:
+   ;; * delete the file if present
    )
 )
 
@@ -365,7 +470,7 @@
   (let [{ :keys [env control entries] } store]
     (doseq [db (cons control (vals entries))]
       ;;(if (not (nil? (:val db))) (db-close db))
-      (db-close db)
+      (if (db-secondary? db) (db-sec-close db) (db-close db))
       ;;(println db) 
       )
     (db-env-checkpoint env)
@@ -383,7 +488,6 @@
   (store-stats [store] (fs-bdb-store-stats store))
   (store-close [store] (fs-bdb-store-close store))
 )
-
 
 ;; (defn conf-from-control
 ;;   "Get the relevant configuration items from the control database."
@@ -403,13 +507,13 @@
                     (.. e (getConfig) (getTransactional))
                     (atom e)))))
 
-(defn store-timestamp [db key & val]
+(defn- store-timestamp [db key & val]
   "Store a UNIX timestamp in a Berkeley DB key as a string."
   (let [date (or (first val) (Date.))]
     (with-db-txn [txn (env-for-db db)]
       (db-put db (name key) (str (quot (.getTime date) 1000)) :txn txn))))
 
-(defn get-timestamp [db key]
+(defn- get-timestamp [db key]
   "Retrieve a UNIX timestamp (as a string) from a Berkeley DB key."
   (let [[_ ts] (db-get db (name key))]
     ;; XXX of course this will throw if the data in the db is bad
@@ -432,6 +536,7 @@
 ;; initialization of digest store
 
 (def ^:private DEFAULTS {:dir (io/as-file "/tmp/digest-store")
+                         :block-size 16r10000
                          :algorithms #{:md5 :sha-1 :sha-256 :sha-384 :sha-512}
                          :primary :sha-256 })
 
@@ -492,6 +597,52 @@
                          (throw (IllegalArgumentException.
                                  (str k ": " c " does not match " vv)))))))))))
 
+;; Secondary digest algorithms are concatenated into byte strings at
+;; the beginning of the database entry value. Their order is
+;; determined by digest-store.core/digest-sizes, which is a sorted
+;; map, first by key length, then by alphabetical order.
+
+;; The secondary digest databases need to be initialized with
+;; key-generation functions, which operate on the *data* from the
+;; primary entry. Since, for compatibility's sake, we are bypassing
+;; the built-in marshalling from cupboard.bdb.je, the data we're
+;; working with has already been serialized into a byte array. As
+;; such, we create a bunch of calls to java.util.Arrays/copyOfRange
+;; with the appropriate offsets (since we know what those are), which
+;; we can inject into the calls to cupboard.bdb.je/db-sec-open.
+
+(defn- digest-offset-fns [conf]
+  ((reduce
+    ;; here is the reduction function
+    (fn [coll [k v]]
+      (let [start (coll :off) end (+ start v)]
+        ;; ...with the updated state,
+        { :off end :out (assoc (coll :out) k
+                               ;; the actual thing we're after
+                               #(Arrays/copyOfRange % start end)) }))
+    ;; here is the accumulator
+    { :off 0 :out {} }
+    ;; here is the input
+    (let [{ :keys [algorithms primary] } conf ]
+      (filter #(and (contains? algorithms (first %)) (not= (first %) primary))
+              digest-sizes)))
+   ;; and finally the output
+   :out))
+
+;; let's just bust out the entry database creation code since it's too
+;; damn hairy to just inline into a let form.
+
+(defn- init-entries [env conf db-conf]
+  (let [key-fns    (digest-offset-fns conf)
+        primary-db (db-open env (name (:primary conf)) db-conf)]
+    (into { (:primary conf) primary-db }
+          (map #(vec [% (db-sec-open env primary-db (name %) 
+                                     (merge db-conf
+                                            { :key-creator-fn (key-fns %) }))])
+               (required-algos (:algorithms conf) (:primary conf))))))
+
+;; and here is the magnificent constructor:
+
 (defmethod digest-store :fs-bdb [_ & [conf-args]]
   ;;"Create and open a filesystem/Berkeley DB-based digest store."
   ;; initialize config with some stuff
@@ -507,12 +658,12 @@
     ;; make sure the target subdirs are present
     (doseq [d [TEMP_DIR STORE_DIR]] (.mkdir (io/file dir d)))
 
-    (let [dbconf { :transactional true :allow-create true }
-          env (db-env-open dir dbconf)
-          control (db-open env "control" dbconf)
-          conf (init-control env control conf-tmp)
-          entries (into {} (map #(vec [% (db-open env (name %) dbconf)])
-                                (:algorithms conf)))]
+    ;; now we open the database handles
+    (let [db-conf { :transactional true :allow-create true }
+          env     (db-env-open dir db-conf)
+          control (db-open env "control" db-conf)
+          conf    (init-control env control conf-tmp)
+          entries (init-entries env conf db-conf)]
       ;; handle counts
       (with-db-txn [txn env]
         (doseq [k [:objects :deleted :bytes]
