@@ -23,7 +23,8 @@
             [gloss.core :as g]
             [gloss.io :as gio]
             [pantomime.mime :as pm])
-  (:import [java.util Date Arrays]
+  (:import [digest_store.core StoreObject]
+           [java.util Date Arrays]
            [java.nio ByteBuffer]
            [java.io File InputStream OutputStream FileNotFoundException])
 )
@@ -55,20 +56,14 @@
 (defn- store-locate
   "Locate the file in the store. Assumes uri represents the primary digest."
   [store uri]
-  (let [base (:dir (:conf store))
+  (let [base (-> store :conf :dir)
         target-slug (-> (ni-uri-digest uri) (hex-decode) (base32-encode))]
     ;; maybe more readable? subs fails with a null pointer exception
     ;; if the upper bound is nil
-    (io/file base STORE_DIR (map #(apply (partial subs target-slug) %)
-                                 [[0 4] [4 8] [8 12] [12]]))))
-;;    (io/file base (subs target-slug 0 4) (subs target-slug 4 8)
-;;             (subs target-slug 8 12) (subs target-slug 12))))
-
-
-;(defmulti ^:private fs-bdb-store-add 
-;  (fn [store item] (type item)))
-
-;(defmethod fs-bdb-store-add Sto
+    (apply io/file
+           (cons base (cons STORE_DIR
+                            (map #(apply (partial subs target-slug) %)
+                                 [[0 4] [4 8] [8 12] [12]]))))))
 
 (defn- all-parents [^File file]
   "Get all the parents of a file. Surprised this doesn't already exist."
@@ -201,14 +196,14 @@
     ([] (f))
     ([result] (f result))
     ([result input]
-     (f result
-        (let [uri (as-uri input)]
-          [(keyword (ni-uri-algorithm uri)) uri])))))
+     (f result (let [uri (as-uri input)] [(ni-uri-algorithm uri) uri])))))
 
 (defn- coerce-to-digest-map [x]
-  (cond (set? x) (into {} uri-pair-xf x)
-        (map? x) (into {} (map #(vec [(first %) (as-uri (second %))])) x)
-        :else (let [y (as-uri x)] { (keyword (ni-uri-algorithm y)) y } )))
+  (cond
+    (instance? StoreObject x) (digests x)
+    (map? x) (into {} (map #(vec [(first %) (as-uri (second %))])) x)
+    (coll? x) (into {} uri-pair-xf x)
+    :else (let [y (as-uri x)] { (keyword (ni-uri-algorithm y)) y } )))
 
 (defn- coerce-to-digest-maps [x]
   (if (and (coll? x) (not (or (set? x) (map? x))))
@@ -216,28 +211,16 @@
     (list (coerce-to-digest-map x))))
 
 (defn- best-digest
+  "Return the 'best' digest given the parameters of the store and a
+  map of digests."
   [store digests]
   (let [conf (:conf store)
         { :keys [primary algorithms] } conf
         x (cons primary (reverse (required-algos algorithms primary)))]
     ;; gives us the "best" digest URI
-    (first (map #(get digests %) x))))
-
-(defn- store-do-something-with-metadata
-  ([store digest-map]
-   (with-db-txn [txn (:env store)]
-     (store-do-something-with-metadata store digest-map txn)))
-  ([store digest-map txn]
-
-   )
-  )
-
-(defn- db-get-multi
-  "Encapsulate a multi-record "
-  [db key & opts-args]
-  (with-db-cursor [cur db]
-  )
-)
+    ;;    (first (map #(get digests %) x))))
+    (when-let [a (first (filter #(contains? digests %) x))]
+      (get digests a))))
 
 (defn- store-get-metadata-single
   "Obtain a single metadata entry from an already-converted key-value pair."
@@ -267,16 +250,13 @@
    (let [primary (-> store :conf :primary)
          algos (-> store :conf :algorithms)
          db (-> store :entries algorithm)
-         gap (- (digest-sizes algorithm) (count key))
-         pad (bs/to-byte-array key (repeat gap 255))
          ;; cmp-fn form is test-key supplied-key
          cmp-fn #(= (bs/compare-bytes (Arrays/copyOf %1 (count %2)) %2) 0)
-         ;;cmp-fn #(> (bs/compare-bytes %1 %2) 0)
          dec-fn (fn [[k v]] (decode-metadata k v algos primary))]
-     (assert (>= gap 0) "Supplied key must be no longer than algorithm length!")
      (with-db-cursor [cur db :txn txn]
-       ;; XXX HEISENBUG: the cursor disappears if this happens in a
-       ;; lazy seq and you get a NullPointerException.
+       ;; XXX HEISENBUG: the cursor falls out of scope if this happens in a
+       ;; lazy seq and you get a NullPointerException. If you try to
+       ;; observe this behaviour, however, it will disappear.
        (doall
         (map dec-fn (db-cursor-scan cur key :comparison-fn cmp-fn)))))))
 
@@ -326,21 +306,36 @@
      (db-put (-> store :entries primary) canon
              (encode-metadata metadata
                               (-> store :conf :algorithms) primary) :txn txn)
-     ;; ;; now do the rest of them
-     ;; (doseq [other (required-algos (:digests metadata) primary)]
-     ;;   (db-put (-> store :entries other)
-     ;;           (hex-decode (ni-uri-digest (-> metadata :digests other)))
-     ;;           canon :txn txn))
-
      ;; iunno, return something?
      true)))
 
-(defn- fs-bdb-store-get [store obj]
+(defn- store-merge-meta-and-file
+  ""
+  [store metadata]
+  (if (-> metadata :times :dtime) (store-object nil metadata)
+      (let [p (-> store :conf :primary)
+            u (-> metadata :digests p)
+            ^File f (store-locate store u)]
+        (when-not (.exists f)
+          (throw (FileNotFoundException.
+                  (str "Internal error: could not find content of " u))))
+        (store-object #(io/input-stream f)
+                      (update-in metadata [:attrs]
+                                 #(merge % { :size (.length f) }))))))
+
+(defn- fs-bdb-store-get [store arg]
   ;; first get metadata
-
-
-  ;; then locate file
-)
+  (let [digests (coerce-to-digest-map arg)
+        [algorithm hex] (ni-uri-split (best-digest store digests))
+        key (hex-decode hex)]
+    ;; here's a question: do we produce a seq unconditonally, or only
+    ;; if the digest is partial?
+;;    (println hex)
+    (if (= (get digest-sizes algorithm) (count key))
+      (when-let [m (store-get-metadata-single store algorithm key)]
+        (store-merge-meta-and-file store m))
+      (for [m (store-get-metadata-multi store algorithm key)]
+        (store-merge-meta-and-file store m)))))
 
 (defn- fs-bdb-store-add [store item]
   ;; 
@@ -399,7 +394,7 @@
                 (.setReadable   p true  true)))
             ;; do some checking on this, apparently java doesn't
             ;; raise an exception if this fails.
-            (when (not (.renameTo temp target-file))
+            (when-not (.renameTo temp target-file)
               (throw (FileNotFoundException.
                       (str "Could not rename " temp " to " target-file))))))
         ;; now deal with the metadata
