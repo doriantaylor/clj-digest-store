@@ -15,7 +15,8 @@
         [clojure.string :only [split trim join]]
         [clojure.set :only [intersection subset?]]
         [digest-store.core :only
-         [DigestStore digest-store valid-digests digest-sizes as-date]])
+         [DigestStore digest-store valid-digests
+          digest-sizes as-date store-object?]])
         
   (:require digest
             [clojure.java.io :as io]
@@ -23,15 +24,14 @@
             [gloss.core :as g]
             [gloss.io :as gio]
             [pantomime.mime :as pm])
-  (:import [digest_store.core StoreObject]
-           [java.util Date Arrays]
+  (:import [java.util Date Arrays]
            [java.nio ByteBuffer]
            [java.io File InputStream OutputStream FileNotFoundException])
 )
 
-(def STORE_DIR "store")
-(def TEMP_DIR  "tmp")
-(def BYTE_ARRAY (class (byte-array 0)))
+(def ^:private STORE_DIR "store")
+(def ^:private TEMP_DIR  "tmp")
+(def ^:private BYTE_ARRAY (class (byte-array 0)))
 
 ;; 
 
@@ -98,18 +98,20 @@
            :encoding (g/string :us-ascii :delimiters [(char 0)]))
 ))
 
-(defn- required-algos
+(defn- secondary-algos
   "Get the ordered list of digest algorithms minus the primary"
-  [algorithms primary]
-  (vec (filter #(and (contains? algorithms %) (not= % primary))
-                     (keys digest-sizes))))
+  ([store]
+   (secondary-algos (-> store :conf :algorithms) (-> store :conf :primary)))
+  ([algorithms primary]
+   (vec (filter #(and (contains? algorithms %) (not= % primary))
+                (keys digest-sizes)))))
 
 (defn- encode-metadata
   "Encode the object's metadata into a byte array. Needs to know the
   set of agorithms in the store and which is the primary one. "
   [data algorithms primary]
   (let [;; this needs to be in the right order
-        reqd     (required-algos algorithms primary)
+        reqd     (secondary-algos algorithms primary)
         data-has (intersection (set (keys (:digests data))) (set reqd))
         digests (do
                   (when (not= (set reqd) data-has)
@@ -142,7 +144,7 @@
 (defn- decode-metadata
   [key data algorithms primary]
   ;; pop the primary algo out and prepend it
-  (let [algos (cons primary (required-algos algorithms primary))
+  (let [algos (cons primary (secondary-algos algorithms primary))
         ;; generate a map of byte arrays
         ba (into { primary key }
                  (map #(vec [% (byte-array (get digest-sizes %))])
@@ -168,7 +170,6 @@
                      (bs/print-bytes mdb)
                      (throw e)))
         ]
-    ;(println digests)
     {:digests digests
      ;; get rid of the empty strings
      :attrs (into {} (filter #(not= "" (second %))
@@ -200,7 +201,7 @@
 
 (defn- coerce-to-digest-map [x]
   (cond
-    (instance? StoreObject x) (digests x)
+    (store-object? x) (digests x)
     (map? x) (into {} (map #(vec [(first %) (as-uri (second %))])) x)
     (coll? x) (into {} uri-pair-xf x)
     :else (let [y (as-uri x)] { (keyword (ni-uri-algorithm y)) y } )))
@@ -216,9 +217,8 @@
   [store digests]
   (let [conf (:conf store)
         { :keys [primary algorithms] } conf
-        x (cons primary (reverse (required-algos algorithms primary)))]
+        x (cons primary (reverse (secondary-algos algorithms primary)))]
     ;; gives us the "best" digest URI
-    ;;    (first (map #(get digests %) x))))
     (when-let [a (first (filter #(contains? digests %) x))]
       (get digests a))))
 
@@ -260,38 +260,6 @@
        (doall
         (map dec-fn (db-cursor-scan cur key :comparison-fn cmp-fn)))))))
 
-(defn- store-get-metadata
-  ([store arg]
-   (with-db-txn [txn (:env store)] (store-get-metadata store arg txn)))
-  ([store arg txn]
-   
-))
-
-(defn- store-get-metadata
-  "Given the store, and one or more digest URIs, sets or maps thereof,
-  or list/seq of those, return a list of"
-  [store arg]
-  (let [primary (-> store :conf :primary)
-        entries (:entries store)
-        algos (-> store :conf :algorithms)
-        digest-list (coerce-to-digest-maps arg)]
-    (with-db-txn [txn (:env store)]
-      (remove nil? 
-              (for [digests digest-list :let [uri (best-digest store digests)]]
-                ;; fetch the entry specified by the URI, and
-                ;; subsequently the main entry if the URI was not a
-                ;; primary hash
-                (let [algo (keyword (ni-uri-algorithm uri))
-                      key (hex-decode (ni-uri-digest uri))
-                      [_ entry1] (db-get (get entries algo) key :txn txn)
-                      [_ entry2] (when (and entry1 (not= primary algo))
-                                   (db-get (get entries primary) entry1
-                                           :txn txn))
-                      entry (or entry2 entry1)]
-                  ;; then all we have to do is decode the content
-                  (when entry
-                    (decode-metadata key entry algos primary))))))))
-
 (defn- store-put-metadata
   "Puts the metadata for a record into the database."
   ([store metadata]
@@ -330,7 +298,6 @@
         key (hex-decode hex)]
     ;; here's a question: do we produce a seq unconditonally, or only
     ;; if the digest is partial?
-;;    (println hex)
     (if (= (get digest-sizes algorithm) (count key))
       (when-let [m (store-get-metadata-single store algorithm key)]
         (store-merge-meta-and-file store m))
@@ -459,7 +426,12 @@
 )
 
 (defn- fs-bdb-store-stats [store]
-)
+  (let [control (:control store)]
+    { :created (get-timestamp control :ctime)
+     :modified (get-timestamp control :mtime)
+     :bytes    (get-db-int control :bytes)
+     :objects  (get-db-int control :objects)
+     :deleted  (get-db-int control :deleted) }))
 
 (defn- fs-bdb-store-close [store]
   (let [{ :keys [env control entries] } store]
@@ -476,23 +448,13 @@
 
 (defrecord FSBDBDigestStore [conf env control entries]
   DigestStore
-  (store-add [store x] (fs-bdb-store-add store (as-store-object x)))
-  (store-get [store x] (fs-bdb-store-get store (as-store-object x)))
-  (store-remove [store x] (fs-bdb-store-remove store (as-store-object x)))
-  (store-forget [store x] (fs-bdb-store-remove store (as-store-object x) true))
+  (store-add [store x] (fs-bdb-store-add store x))
+  (store-get [store x] (fs-bdb-store-get store x))
+  (store-remove [store x] (fs-bdb-store-remove store x))
+  (store-forget [store x] (fs-bdb-store-remove store x true))
   (store-stats [store] (fs-bdb-store-stats store))
   (store-close [store] (fs-bdb-store-close store))
 )
-
-;; (defn conf-from-control
-;;   "Get the relevant configuration items from the control database."
-;;   [control]
-;;   (let [[_ algorithms] (db-get control "algorithms")
-;;         [_ primary] (db-get control "primary")]
-;;     { :algorithms (if algorithms
-;;                     (set (map keyword (split (trim algorithms) #"\s*,+\s*")))
-;;                     #{})
-;;       :primary (when primary (keyword primary)) }))
 
 ;; cribbed from cupboard.bdb.je
 (defn- env-for-db [db]
@@ -502,31 +464,45 @@
                     (.. e (getConfig) (getTransactional))
                     (atom e)))))
 
-(defn- store-timestamp [db key & val]
+(defn- store-timestamp
   "Store a UNIX timestamp in a Berkeley DB key as a string."
-  (let [date (or (first val) (Date.))]
-    (with-db-txn [txn (env-for-db db)]
-      (db-put db (name key) (str (quot (.getTime date) 1000)) :txn txn))))
+  ([db key]
+   (store-timestamp db key nil))
+  ([db key val]
+   (with-db-txn [txn (env-for-db db)] (store-timestamp db key val txn)))
+  ([db key val txn]
+   (let [date (or val (Date.))]
+     (db-put db (name key) (str (quot (.getTime date) 1000)) :txn txn))))
 
-(defn- get-timestamp [db key]
+(defn- get-timestamp
   "Retrieve a UNIX timestamp (as a string) from a Berkeley DB key."
-  (let [[_ ts] (db-get db (name key))]
-    ;; XXX of course this will throw if the data in the db is bad
-    (when (not (nil? ts))
-      (Date. (* (Integer/parseInt ts) 1000)))))
+  ([db key]
+   (with-db-txn [txn (env-for-db db)] (get-timestamp db key txn)))
+  ([db key txn]
+     (let [[_ ts] (db-get db (name key) :txn txn)]
+       ;; XXX of course this will throw if the data in the db is bad
+       (when (not (nil? ts))
+         (Date. (* (Integer/parseInt ts) 1000))))))
+
+(defn- get-db-int
+  ([db key]
+   (with-db-txn [txn (env-for-db db)] (get-db-int db key txn)))
+  ([db key txn]
+   (let [k (name key)
+         [_ v] (db-get db k :txn txn)]
+     (Integer/parseInt (or v "0")))))
 
 (defn- inc-db-int
+  "'Increment' a numeric database entry by a number (which may be negative)."
   ([db key val]
    (with-db-txn [txn (env-for-db db)]
      (inc-db-int db key val txn)))
   ([db key val txn]
-   (when-not (= 0 val)
-     (let [k (name key)
-           [_ v] (db-get db k :txn txn)
-           x (Integer/parseInt (or v "0"))
-           y (+ x val)]
-       (db-put db k (str y) :txn txn)
-       y))))
+   (let [x (get-db-int db key txn)
+         y (+ x val)]
+     (when-not (= 0 val)
+       (db-put db (name key) (str y) :txn txn))
+     y)))
 
 ;; initialization of digest store
 
@@ -546,26 +522,6 @@
              :error (str "Primary algorithm not in " (:algorithms DEFAULTS))
              }
 })
-
-;; (defn- -init-conf [args]
-;;   "Merge defaults and make sure the base directory is present"
-;;   (let [c (if (nil? conf-args) DEFAULTS (merge DEFAULTS conf-args))
-;;         d (io/as-file (:dir c))]
-;;     ;; make sure the algorithms supplied are supported
-;;     (when-not (subset? (:algorithms c) (:algorithms DEFAULTS))
-;;       (throw
-;;        (IllegalArgumentException. (:error (:algorithms CONTROL_MAP)))))
-
-;;     ;; make sure the primary algorithm is in the supplied algorithm set
-;;     (when-not (contains? (:algorithms c) (:primary c))
-;;       (throw
-;;        (IllegalArgumentException.
-;;         "Primary digest algorithm must be in supported algorithms list.")))
-
-;;     ;; this will crap out with the right exception if the directory
-;;     ;; stack doesn't exist and/or can't be created
-;;     (.mkdirs d)
-;;     (assoc c :dir d)))
 
 (defn- init-control [env db conf]
   (merge conf
@@ -629,12 +585,13 @@
 
 (defn- init-entries [env conf db-conf]
   (let [key-fns    (digest-offset-fns conf)
-        primary-db (db-open env (name (:primary conf)) db-conf)]
-    (into { (:primary conf) primary-db }
+        primary    (:primary conf)
+        primary-db (db-open env (name primary) db-conf)]
+    (into { primary primary-db }
           (map #(vec [% (db-sec-open env primary-db (name %) 
                                      (merge db-conf
                                             { :key-creator-fn (key-fns %) }))])
-               (required-algos (:algorithms conf) (:primary conf))))))
+               (secondary-algos (:algorithms conf) primary)))))
 
 ;; and here is the magnificent constructor:
 
@@ -659,16 +616,17 @@
           control (db-open env "control" db-conf)
           conf    (init-control env control conf-tmp)
           entries (init-entries env conf db-conf)]
-      ;; handle counts
+
       (with-db-txn [txn env]
+        ;; handle counts
         (doseq [k [:objects :deleted :bytes]
                 :let [[_ v] (db-get control (name k) :txn txn)]]
           (when (nil? v)
-            (db-put control (name k) "0" :txn txn))))
-          
-      ;; handle creation/modification times
-      (doseq [k [:ctime :mtime] :let [time (get-timestamp control k)]]
-        (when (nil? time)
-          (store-timestamp control k)))
+            (db-put control (name k) "0" :txn txn)))
+        ;; handle creation/modification times
+        (doseq [k [:ctime :mtime] :let [time (get-timestamp control k)]]
+          (when (nil? time)
+            (store-timestamp control k txn))))
+
       ;; return the constructor
       (->FSBDBDigestStore conf env control entries))))

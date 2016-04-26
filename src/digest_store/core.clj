@@ -170,6 +170,8 @@
                              :encoding-checked :encoding-valid
                              :syntax-checked   :syntax-valid})
 
+(defn store-object? [x] (instance? StoreObject x))
+
 (defn store-object
   "Create a new digest store object."
   ([] (store-object nil nil nil nil nil))
